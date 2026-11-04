@@ -7,11 +7,10 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
-
+    runs-on: macos-13
+    timeout-minutes: 15
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Select Latest Xcode
         run: |
