@@ -1,0 +1,22 @@
+name: A17RemoteGPU
+
+options:
+  bundleIdPrefix: com.remoteGPU
+
+targets:
+  A17RemoteGPU:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    sources:
+      - path: Sources
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.remoteGPU.A17RemoteGPU
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Connect to your Windows computer for remote GPU processing."
+        CODE_SIGNING_ALLOWED: NO
