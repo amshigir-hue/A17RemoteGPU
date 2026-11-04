@@ -1,50 +1,47 @@
-
-name: Build A17RemoteGPU iOS
+name: Build Unsigned IPA
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Build iOS application
+      - name: Install Tools
         run: |
-          set -o pipefail
-          xcodebuild \
+          brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: |
+          xcodegen generate
+
+      - name: Build Application
+        run: |
+          xcodebuild clean build \
             -project A17RemoteGPU.xcodeproj \
             -scheme A17RemoteGPU \
-            -sdk iphoneos \
             -configuration Release \
+            -sdk iphoneos \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tee build.log
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
 
-      - name: Show compiler errors
-        if: always()
+      - name: Package IPA
         run: |
-          echo "===== ERRORS ====="
-          grep -n -B 5 -A 12 "error:" build.log || true
-          echo "===== WARNINGS ====="
-          grep -n -B 2 -A 5 "warning:" build.log || true
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/A17RemoteGPU.app Payload/
+          zip -r A17RemoteGPU.ipa Payload
+          rm -rf Payload
 
-      - name: Upload build log
-        if: always()
+      - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: A17RemoteGPU-build-log
-          path: build.log
-          if-no-files-found: ignore
+          name: A17RemoteGPU-unsigned
+          path: A17RemoteGPU.ipa
