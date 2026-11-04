@@ -1,215 +1,173 @@
 import SwiftUI
-import Network
 import Metal
+import Network
 
-final class GPUServer: ObservableObject {
+@main
+struct A17RemoteGPUApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
 
-    @Published var status = "Stopped"
-
-    private let queue = DispatchQueue(
-        label: "A17.RemoteGPU"
-    )
+final class MetalServerModel: ObservableObject {
+    @Published var serverStatus = "Initializing..."
+    @Published var log = "Ready."
 
     private var listener: NWListener?
+    private let device: MTLDevice?
+    private let commandQueue: MTLCommandQueue?
+    private let pipelineState: MTLComputePipelineState?
 
-    private let device = MTLCreateSystemDefaultDevice()
+    init() {
+        let dev = MTLCreateSystemDefaultDevice()
+        self.device = dev
+        self.commandQueue = dev?.makeCommandQueue()
 
-    func start() {
-        guard let device = device else {
-            status = "Metal GPU unavailable"
+        if let dev = dev,
+           let library = dev.makeDefaultLibrary(),
+           let function = library.makeFunction(name: "square_array") {
+            self.pipelineState = try? dev.makeComputePipelineState(function: function)
+        } else {
+            self.pipelineState = nil
+        }
+    }
+
+    func startTCPServer() {
+        guard device != nil, pipelineState != nil, commandQueue != nil else {
+            self.serverStatus = "Metal initialization failed (GPU/Shader missing)"
             return
         }
 
         do {
-            let library = try device.makeDefaultLibrary()
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            let newListener = try NWListener(using: parameters, on: 8888)
 
-            guard let function = library.makeFunction(
-                name: "square_ids"
-            ) else {
-                status = "Metal shader missing"
-                return
-            }
-
-            let pipeline = try device.makeComputePipelineState(
-                function: function
-            )
-
-            guard let commandQueue = device.makeCommandQueue() else {
-                status = "Command queue failed"
-                return
-            }
-
-            let server = try NWListener(
-                using: .tcp,
-                on: NWEndpoint.Port(rawValue: 8765)!
-            )
-
-            listener = server
-
-            server.newConnectionHandler = { [weak self] connection in
-                guard let self = self else { return }
-
-                connection.start(queue: self.queue)
-
-                self.receiveRequest(
-                    connection,
-                    pipeline,
-                    commandQueue
-                )
-            }
-
-            server.stateUpdateHandler = { [weak self] state in
+            newListener.stateUpdateHandler = { [weak self] state in
                 DispatchQueue.main.async {
                     switch state {
                     case .ready:
-                        self?.status = "Listening on TCP 8765"
-                    case .failed(let error):
-                        self?.status = "Error: \(error)"
+                        self?.serverStatus = "Listening on port 8888"
+                    case .failed(let err):
+                        self?.serverStatus = "Listener failed: \(err.localizedDescription)"
                     default:
                         break
                     }
                 }
             }
 
-            server.start(queue: queue)
+            newListener.newConnectionHandler = { [weak self] connection in
+                connection.start(queue: .global(qos: .userInteractive))
+                self?.receive(on: connection)
+            }
 
+            newListener.start(queue: .global())
+            self.listener = newListener
         } catch {
-            status = "Error: \(error.localizedDescription)"
+            self.serverStatus = "Failed to create listener: \(error.localizedDescription)"
         }
     }
 
-    private func receiveRequest(
-        _ connection: NWConnection,
-        _ pipeline: MTLComputePipelineState,
-        _ commandQueue: MTLCommandQueue
-    ) {
-
-        connection.receive(
-            minimumIncompleteLength: 4,
-            maximumLength: 4
-        ) { [weak self] data, _, _, error in
-
-            guard let self = self,
-                  error == nil,
-                  let data = data,
-                  data.count == 4 else {
+    private func receive(on connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] content, _, _, _ in
+            guard let self = self, let data = content, data.count == 4 else {
                 connection.cancel()
                 return
             }
 
-            let count = Int(
-                data.withUnsafeBytes {
-                    $0.loadUnaligned(as: UInt32.self)
-                }.littleEndian
-            )
+            let count = Int(data.withUnsafeBytes { $0.load(as: UInt32.self) })
+            let payloadBytes = count * MemoryLayout<Float>.size
 
-            guard count > 0 && count <= 1_000_000 else {
-                connection.cancel()
-                return
-            }
-
-            guard let output = self.device?.makeBuffer(
-                length: count * MemoryLayout<UInt32>.stride,
-                options: .storageModeShared
-            ),
-            let command = commandQueue.makeCommandBuffer(),
-            let encoder = command.makeComputeCommandEncoder() else {
-                connection.cancel()
-                return
-            }
-
-            encoder.setComputePipelineState(pipeline)
-            encoder.setBuffer(output, offset: 0, index: 0)
-
-            var gpuCount = UInt32(count)
-
-            encoder.setBytes(
-                &gpuCount,
-                length: MemoryLayout<UInt32>.stride,
-                index: 1
-            )
-
-            let threads = 256
-
-            let groups = (
-                count + threads - 1
-            ) / threads
-
-            encoder.dispatchThreadgroups(
-                MTLSize(width: groups, height: 1, depth: 1),
-                threadsPerThreadgroup:
-                    MTLSize(width: threads, height: 1, depth: 1)
-            )
-
-            encoder.endEncoding()
-
-            command.commit()
-            command.waitUntilCompleted()
-
-            guard command.status == .completed else {
-                connection.cancel()
-                return
-            }
-
-            let values = output.contents().bindMemory(
-                to: UInt32.self,
-                capacity: count
-            )
-
-            var checksum: UInt64 = 0
-
-            for i in 0..<count {
-                checksum &+= UInt64(values[i])
-            }
-
-            var result = Data("OKAY".utf8)
-
-            var littleEndianChecksum = checksum.littleEndian
-
-            withUnsafeBytes(of: &littleEndianChecksum) {
-                result.append(contentsOf: $0)
-            }
-
-            connection.send(
-                content: result,
-                completion: .contentProcessed { _ in
+            connection.receive(minimumIncompleteLength: payloadBytes, maximumLength: payloadBytes) { [weak self] bufferData, _, _, _ in
+                guard let self = self, let bufferData = bufferData, bufferData.count == payloadBytes else {
                     connection.cancel()
+                    return
                 }
-            )
 
-            DispatchQueue.main.async {
-                self.status = "GPU completed \(count) elements"
+                let inputs: [Float] = bufferData.withUnsafeBytes { rawPtr in
+                    let bound = rawPtr.bindMemory(to: Float.self)
+                    return Array(bound)
+                }
+
+                let outputs = self.runCompute(inputs: inputs)
+
+                var responseData = Data()
+                outputs.withUnsafeBufferPointer { ptr in
+                    responseData.append(ptr)
+                }
+
+                connection.send(content: responseData, completion: .contentProcessed({ _ in
+                    connection.cancel()
+                }))
+
+                DispatchQueue.main.async {
+                    self.log = "Processed \(count) floats on Apple GPU."
+                }
             }
         }
+    }
+
+    private func runCompute(inputs: [Float]) -> [Float] {
+        guard let device = device,
+              let commandQueue = commandQueue,
+              let pipelineState = pipelineState,
+              !inputs.isEmpty else { return [] }
+
+        let count = inputs.count
+        let bufferSize = count * MemoryLayout<Float>.size
+
+        guard let inBuffer = device.makeBuffer(bytes: inputs, length: bufferSize, options: .storageModeShared),
+              let outBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return []
+        }
+
+        encoder.setComputePipelineState(pipelineState)
+        encoder.setBuffer(inBuffer, offset: 0, index: 0)
+        encoder.setBuffer(outBuffer, offset: 0, index: 1)
+
+        let maxThreads = pipelineState.maxTotalThreadsPerThreadgroup
+        let threadsPerGroup = MTLSize(width: min(count, maxThreads), height: 1, depth: 1)
+        let numGroups = MTLSize(width: (count + threadsPerGroup.width - 1) / threadsPerGroup.width, height: 1, depth: 1)
+
+        encoder.dispatchThreadgroups(numGroups, threadsPerThreadgroup: threadsPerGroup)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let rawPointer = outBuffer.contents().bindMemory(to: Float.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: rawPointer, count: count))
     }
 }
 
 struct ContentView: View {
-
-    @StateObject private var server = GPUServer()
+    @StateObject private var server = MetalServerModel()
 
     var body: some View {
         VStack(spacing: 20) {
+            Text("A17 Remote Metal Worker")
+                .font(.headline)
 
-            Image(systemName: "cpu")
-                .font(.system(size: 55))
+            Text(server.serverStatus)
+                .foregroundColor(.green)
+                .font(.subheadline)
 
-            Text("A17 Remote GPU")
-                .font(.largeTitle.bold())
-
-            Text("Apple Metal Compute Server")
-
-            Text(server.status)
-                .foregroundStyle(.green)
-
-            Button("Start GPU Server") {
-                server.start()
+            ScrollView {
+                Text(server.log)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
             }
-            .buttonStyle(.borderedProminent)
-
-            Text("TCP Port: 8765")
-                .font(.caption)
+            .background(Color(.secondarySystemBackground))
+            .cornerRadius(8)
+            .padding()
         }
-        .padding()
+        .onAppear {
+            server.startTCPServer()
+        }
     }
 }
