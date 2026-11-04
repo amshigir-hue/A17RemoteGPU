@@ -1,3 +1,26 @@
+name: Build A17RemoteGPU iOS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build iOS application
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
       - name: Build iOS application
         run: |
           set -o pipefail
@@ -17,3 +40,4 @@
         with:
           name: A17RemoteGPU-build-log
           path: build.log
+          if-no-files-found: ignore
