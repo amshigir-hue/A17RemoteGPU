@@ -18,19 +18,36 @@ final class MetalServerModel: ObservableObject {
     private var listener: NWListener?
     private let device: MTLDevice?
     private let commandQueue: MTLCommandQueue?
-    private let pipelineState: MTLComputePipelineState?
+    private var pipelineState: MTLComputePipelineState?
+
+    // Embedded Metal compute kernel to ensure runtime loading in LiveContainer
+    private let metalSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    kernel void compute_checksum(device uint* outBuffer [[buffer(0)]],
+                                 uint id [[thread_position_in_grid]]) {
+        outBuffer[id] = id * id;
+    }
+    """
 
     init() {
         let dev = MTLCreateSystemDefaultDevice()
         self.device = dev
         self.commandQueue = dev?.makeCommandQueue()
 
-        if let dev = dev,
-           let library = dev.makeDefaultLibrary(),
-           let function = library.makeFunction(name: "compute_checksum") {
-            self.pipelineState = try? dev.makeComputePipelineState(function: function)
-        } else {
-            self.pipelineState = nil
+        if let dev = dev {
+            do {
+                // Compile directly from string (bypasses bundle path resolution)
+                let library = try dev.makeLibrary(source: metalSource, options: nil)
+                if let function = library.makeFunction(name: "compute_checksum") {
+                    self.pipelineState = try dev.makeComputePipelineState(function: function)
+                } else {
+                    self.pipelineState = nil
+                }
+            } catch {
+                self.pipelineState = nil
+            }
         }
     }
 
@@ -43,7 +60,6 @@ final class MetalServerModel: ObservableObject {
         do {
             let parameters = NWParameters.tcp
             parameters.allowLocalEndpointReuse = true
-            // Listening on 8765 to match gpu_test.py
             let newListener = try NWListener(using: parameters, on: 8765)
 
             newListener.stateUpdateHandler = { [weak self] state in
@@ -72,7 +88,6 @@ final class MetalServerModel: ObservableObject {
     }
 
     private func receive(on connection: NWConnection) {
-        // Read 4-byte little-endian count
         connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] content, _, _, _ in
             guard let self = self, let data = content, data.count == 4 else {
                 connection.cancel()
@@ -81,7 +96,6 @@ final class MetalServerModel: ObservableObject {
 
             let count = Int(data.withUnsafeBytes { $0.load(as: UInt32.self) })
             
-            // Execute on Apple GPU
             let checksum = self.runCompute(count: count)
 
             // Construct 12-byte response: b"OKAY" + uint64 checksum
@@ -105,7 +119,6 @@ final class MetalServerModel: ObservableObject {
               let pipelineState = pipelineState,
               count > 0 else { return 0 }
 
-        // Allocate buffer for per-thread output
         let bufferSize = count * MemoryLayout<UInt32>.size
         guard let outBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared),
               let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -126,7 +139,6 @@ final class MetalServerModel: ObservableObject {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        // Sum up GPU results with 64-bit wrap-around
         let rawPointer = outBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
         var total: UInt64 = 0
         for i in 0..<count {
