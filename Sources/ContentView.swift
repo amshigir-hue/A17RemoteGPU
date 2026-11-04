@@ -27,7 +27,7 @@ final class MetalServerModel: ObservableObject {
 
         if let dev = dev,
            let library = dev.makeDefaultLibrary(),
-           let function = library.makeFunction(name: "square_array") {
+           let function = library.makeFunction(name: "compute_checksum") {
             self.pipelineState = try? dev.makeComputePipelineState(function: function)
         } else {
             self.pipelineState = nil
@@ -43,13 +43,14 @@ final class MetalServerModel: ObservableObject {
         do {
             let parameters = NWParameters.tcp
             parameters.allowLocalEndpointReuse = true
-            let newListener = try NWListener(using: parameters, on: 8888)
+            // Listening on 8765 to match gpu_test.py
+            let newListener = try NWListener(using: parameters, on: 8765)
 
             newListener.stateUpdateHandler = { [weak self] state in
                 DispatchQueue.main.async {
                     switch state {
                     case .ready:
-                        self?.serverStatus = "Listening on port 8888"
+                        self?.serverStatus = "Listening on port 8765"
                     case .failed(let err):
                         self?.serverStatus = "Listener failed: \(err.localizedDescription)"
                     default:
@@ -71,6 +72,7 @@ final class MetalServerModel: ObservableObject {
     }
 
     private func receive(on connection: NWConnection) {
+        // Read 4-byte little-endian count
         connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] content, _, _, _ in
             guard let self = self, let data = content, data.count == 4 else {
                 connection.cancel()
@@ -78,56 +80,41 @@ final class MetalServerModel: ObservableObject {
             }
 
             let count = Int(data.withUnsafeBytes { $0.load(as: UInt32.self) })
-            let payloadBytes = count * MemoryLayout<Float>.size
+            
+            // Execute on Apple GPU
+            let checksum = self.runCompute(count: count)
 
-            connection.receive(minimumIncompleteLength: payloadBytes, maximumLength: payloadBytes) { [weak self] bufferData, _, _, _ in
-                guard let self = self, let bufferData = bufferData, bufferData.count == payloadBytes else {
-                    connection.cancel()
-                    return
-                }
+            // Construct 12-byte response: b"OKAY" + uint64 checksum
+            var response = Data("OKAY".utf8)
+            var sum = checksum
+            response.append(UnsafeBufferPointer(start: &sum, count: 1))
 
-                let inputs: [Float] = bufferData.withUnsafeBytes { rawPtr in
-                    let bound = rawPtr.bindMemory(to: Float.self)
-                    return Array(bound)
-                }
+            connection.send(content: response, completion: .contentProcessed({ _ in
+                connection.cancel()
+            }))
 
-                let outputs = self.runCompute(inputs: inputs)
-
-                var responseData = Data()
-                outputs.withUnsafeBufferPointer { ptr in
-                    responseData.append(ptr)
-                }
-
-                connection.send(content: responseData, completion: .contentProcessed({ _ in
-                    connection.cancel()
-                }))
-
-                DispatchQueue.main.async {
-                    self.log = "Processed \(count) floats on Apple GPU."
-                }
+            DispatchQueue.main.async {
+                self.log = "Calculated checksum for \(count) elements on GPU:\n\(checksum)"
             }
         }
     }
 
-    private func runCompute(inputs: [Float]) -> [Float] {
+    private func runCompute(count: Int) -> UInt64 {
         guard let device = device,
               let commandQueue = commandQueue,
               let pipelineState = pipelineState,
-              !inputs.isEmpty else { return [] }
+              count > 0 else { return 0 }
 
-        let count = inputs.count
-        let bufferSize = count * MemoryLayout<Float>.size
-
-        guard let inBuffer = device.makeBuffer(bytes: inputs, length: bufferSize, options: .storageModeShared),
-              let outBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared),
+        // Allocate buffer for per-thread output
+        let bufferSize = count * MemoryLayout<UInt32>.size
+        guard let outBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared),
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            return []
+            return 0
         }
 
         encoder.setComputePipelineState(pipelineState)
-        encoder.setBuffer(inBuffer, offset: 0, index: 0)
-        encoder.setBuffer(outBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outBuffer, offset: 0, index: 0)
 
         let maxThreads = pipelineState.maxTotalThreadsPerThreadgroup
         let threadsPerGroup = MTLSize(width: min(count, maxThreads), height: 1, depth: 1)
@@ -139,8 +126,13 @@ final class MetalServerModel: ObservableObject {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        let rawPointer = outBuffer.contents().bindMemory(to: Float.self, capacity: count)
-        return Array(UnsafeBufferPointer(start: rawPointer, count: count))
+        // Sum up GPU results with 64-bit wrap-around
+        let rawPointer = outBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
+        var total: UInt64 = 0
+        for i in 0..<count {
+            total = total &+ UInt64(rawPointer[i])
+        }
+        return total
     }
 }
 
