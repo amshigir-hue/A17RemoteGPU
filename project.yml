@@ -2,6 +2,7 @@ name: A17RemoteGPU
 
 options:
   bundleIdPrefix: com.remoteGPU
+  xcodeVersion: "15.0"
 
 targets:
   A17RemoteGPU:
