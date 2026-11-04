@@ -1,7 +1,29 @@
+
+name: Build A17RemoteGPU iOS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
       - name: Build iOS application
         run: |
           set -o pipefail
-
           xcodebuild \
             -project A17RemoteGPU.xcodeproj \
             -scheme A17RemoteGPU \
@@ -16,7 +38,6 @@
         run: |
           echo "===== ERRORS ====="
           grep -n -B 5 -A 12 "error:" build.log || true
-
           echo "===== WARNINGS ====="
           grep -n -B 2 -A 5 "warning:" build.log || true
 
